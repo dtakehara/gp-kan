@@ -302,23 +302,24 @@ class LayerFused(torch.nn.Module):
 
     def save_fig(self, path: str):
         """save a figure showing the GP dist of all neurons"""
-        MAX_NEURONS_SHOWN = 5
+        MAX_NEURONS_SHOWN = 20
         plot_num = min(self.num_neurons, MAX_NEURONS_SHOWN)
 
-        fig, axes = plt.subplots(1, 2, squeeze=False)
+        # fig, axes = plt.subplots(1, plot_num, squeeze=False)
+        fig, axes = plt.subplots(self.I, self.O, squeeze=False)
 
         axes_idx = 0
         for i_idx in range(self.I):
             for o_idx in range(self.O):
                 if axes_idx < plot_num:
-                    self.plot_neuron(axes[0, axes_idx], i_idx, o_idx)
+                    self.plot_neuron(axes[i_idx, o_idx], i_idx, o_idx)
                     axes_idx += 1
 
-        fig.set_figwidth(20)
-        fig.set_figheight(5)
+        # fig.set_figwidth(20)
+        # fig.set_figheight(5)
         fig.savefig(path)
 
-        plt.close(fig)
+        # plt.close(fig)
 
     def set_all_trainable(self):
         for p in self.parameters():

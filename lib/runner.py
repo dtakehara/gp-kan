@@ -2,7 +2,6 @@ import json
 import pathlib
 
 import torch.utils.data.dataloader
-
 from lib import utils
 from lib.gp_dist import GP_dist
 from lib.layer import HYP_CTX
@@ -71,30 +70,35 @@ def eval_model(
     data_loader: torch.utils.data.dataloader.DataLoader, model: GP_Model, gpu=True
 ):
     with torch.no_grad():
-        correct_count = 0
+        # correct_count = 0
         total_count = 0
+        rse = 0
         eval_val = 0.0
-        for _, [features, labels] in enumerate(utils.progress_bar(data_loader)):
+        # for _, [features, labels] in enumerate(utils.progress_bar(data_loader)):
+        for _, [features, targets] in enumerate(utils.progress_bar(data_loader)):
             batch_size: int = features.shape[0]
 
-            if gpu:
-                features = features.cuda()
-                labels = labels.cuda()
+            # if gpu:
+            #     features = features.cuda()
+            #     labels = labels.cuda()
 
             model_out = model.forward(GP_dist.fromTensor(features))
-            assert utils.same_shape(model_out.mean.shape, labels.shape)
+            # assert utils.same_shape(model_out.mean.shape, labels.shape)
+            assert utils.same_shape(model_out.mean.shape, targets.shape)
 
-            loglik = utils.log_likelihood(model_out.mean, model_out.var, labels)
+            # loglik = utils.log_likelihood(model_out.mean, model_out.var, labels)
+            loglik = utils.log_likelihood(model_out.mean, model_out.var, targets)
 
-            corrects = torch.argmax(model_out.mean, dim=1) == torch.argmax(
-                labels, dim=1
-            )
+            # corrects = torch.argmax(model_out.mean, dim=1) == torch.argmax(
+            #     labels, dim=1
+            # )
+            rse += torch.sum((model_out.mean - targets) ** 2).item()
 
             eval_val += -torch.sum(loglik).item()
-            correct_count += torch.count_nonzero(corrects).item()
+            # correct_count += torch.count_nonzero(corrects).item()
             total_count += batch_size
 
-    return (eval_val / total_count, correct_count / total_count)
+    return (eval_val / total_count, rse / total_count)
 
 
 def test_model(
@@ -129,10 +133,13 @@ def train_model(
     if use_gpu:
         model.cuda()
     if pretrain:
-        pretrain_model(model)
+        pretrain_model(
+            model, iters=10
+        )  # 誘導点位置の最適化前にハイパーパラメータを調整
 
     model.freeze_all_params()
     model.set_all_trainable()
+    # model.set_gp_pts_trainable()  # 誘導点のみ最適化
 
     optimizerSGD = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizerSGD, gamma=0.9)
@@ -143,7 +150,8 @@ def train_model(
     for epoch in range(start_epoch, start_epoch + epochs):
         train_loglik = 0.0
         total_count = 0
-        for _, [train_features, train_labels] in enumerate(
+        # for _, [train_features, train_labels] in enumerate(
+        for _, [train_features, train_targets] in enumerate(
             utils.progress_bar(train_dataloader)
         ):
             optimizerSGD.zero_grad()
@@ -151,10 +159,10 @@ def train_model(
             # go through all data
             if use_gpu:
                 train_features = train_features.cuda()
-                train_labels = train_labels.cuda()
+                train_targets = train_targets.cuda()
             model_out = model.predict(train_features)
-            assert utils.same_shape(model_out.mean.shape, train_labels.shape)
-            loglik = utils.log_likelihood(model_out.mean, model_out.var, train_labels)
+            assert utils.same_shape(model_out.mean.shape, train_targets.shape)
+            loglik = utils.log_likelihood(model_out.mean, model_out.var, train_targets)
             obj_value = -torch.sum(loglik) / batch_size
             obj_value.backward()
             optimizerSGD.step()
