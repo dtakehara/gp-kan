@@ -1,175 +1,117 @@
 """
-GPKAN: 完全なネットワークモデル
+GPKAN: GP Kolmogorov-Arnold Network
 
-複数のGPKANLayerを積み重ねた深層ネットワークモデルの実装。
+エッジベースのGPネットワーク実装。
 """
 
 from typing import Tuple
 
 import torch
-import torch.nn as nn
 from gpytorch.likelihoods import GaussianLikelihood
 
+from .base_model import BaseGPModel
 from .gpkan_layer import GPKANLayer
 
 
-class GPKAN(nn.Module):
-    """
-    GP-KAN (Gaussian Process Kolmogorov-Arnold Network)
-    
-    複数のGPKANLayerを積み重ねて深層ネットワークを構築します。
-    """
-    
+class GPKAN(BaseGPModel):
+    """GP-KAN: エッジベースのGPネットワーク"""
+
     def __init__(
         self,
         layer_sizes: list,
         num_inducing: int = 10,
-        inducing_range: Tuple[float, float] = (-2.0, 2.0)
+        inducing_range: Tuple[float, float] = (-2.0, 2.0),
     ):
-        """
-        Args:
-            layer_sizes: 各層のサイズリスト（例: [2, 1] は 2入力→1出力）
-            num_inducing: 各GPエッジの誘導点数
-            inducing_range: 誘導点の初期配置範囲
-        """
-        super(GPKAN, self).__init__()
-        
-        self.layer_sizes = layer_sizes
-        self.num_layers = len(layer_sizes) - 1
-        self.num_inducing = num_inducing
-        
-        self.layers = nn.ModuleList()
-        for i in range(self.num_layers):
-            layer = GPKANLayer(
-                input_size=layer_sizes[i],
-                output_size=layer_sizes[i + 1],
-                num_inducing=num_inducing,
-                inducing_range=inducing_range
-            )
-            self.layers.append(layer)
-        
+        super().__init__(layer_sizes, num_inducing)
+
+        self.layers = torch.nn.ModuleList(
+            [
+                GPKANLayer(
+                    input_size=layer_sizes[i],
+                    output_size=layer_sizes[i + 1],
+                    num_inducing=num_inducing,
+                    inducing_range=inducing_range,
+                )
+                for i in range(self.num_layers)
+            ]
+        )
+
         self.likelihood = GaussianLikelihood()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        順伝播
-        
-        Args:
-            x: 入力テンソル
-        Returns:
-            出力テンソル
-        """
-        current_input = x
         for layer in self.layers:
-            current_input = layer(current_input)
-        return current_input
-    
+            x = layer(x)
+        return x
+
     def predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        予測を実行（全エッジの寄与を集約）
-        
-        Args:
-            x: 入力テンソル
-        Returns:
-            (予測平均, 予測分散) のタプル
-        """
         self.eval()
         with torch.no_grad():
-            # 最終層まで順伝播
-            current_input = x
+            # 最終層以外を順伝播
             for layer in self.layers[:-1]:
-                current_input = layer(current_input)
-            
-            # 最終層の処理（全エッジからの寄与を集約）
+                x = layer(x)
+
+            # 最終層: 全エッジの GP後験分布 + 線形残差 を集約
             final_layer = self.layers[-1]
-            batch_size = current_input.size(0)
-            
-            # 各出力次元について予測
-            predictions = []
-            variances = []
-            
+            predictions, variances = [], []
+
             for j in range(final_layer.output_size):
-                node_mean = torch.zeros(batch_size)
-                node_var = torch.zeros(batch_size)
-                
-                # 全入力次元からの寄与を集約
+                mean = torch.zeros(x.size(0))
+                var = torch.zeros(x.size(0))
+
                 for i in range(final_layer.input_size):
                     gp_edge = final_layer.gp_edges[i][j]
-                    likelihood = final_layer.likelihoods[i][j]
-                    
-                    input_i = current_input[:, i:i+1]
+                    input_i = x[:, i:i+1]
                     gp_dist = gp_edge(input_i)
-                    pred_dist = likelihood(gp_dist)
-                    
-                    node_mean = node_mean + pred_dist.mean
-                    node_var = node_var + pred_dist.variance
-                
-                predictions.append(node_mean)
-                variances.append(node_var)
-            
+                    residual = (
+                        final_layer.residual_weights[i, j]
+                        * input_i.squeeze(-1)
+                    )
+                    mean += gp_dist.mean + residual
+                    var += gp_dist.variance
+
+                predictions.append(mean)
+                variances.append(var)
+
             if final_layer.output_size == 1:
                 return predictions[0], variances[0]
-            else:
-                return torch.stack(predictions, dim=-1), torch.stack(variances, dim=-1)
-    
+            return (
+                torch.stack(predictions, dim=-1),
+                torch.stack(variances, dim=-1),
+            )
+
     def get_total_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        全レイヤーの損失を計算
-        
-        Args:
-            x: 入力テンソル
-            y: ターゲットテンソル
-        Returns:
-            損失値（スカラー）
-        """
-        current_input = x
-        total_loss = 0.0
-        
-        for i, layer in enumerate(self.layers):
-            if i == len(self.layers) - 1:
-                # 最終層: 全エッジの損失を layer.get_loss() で計算
-                loss = layer.get_loss(current_input, y)
-                total_loss += loss
-            else:
-                # 中間層: 次の層への伝播
-                current_input = layer(current_input)
-        
-        return total_loss
-    
+        # 中間層: KL損失を収集しながら決定論的に順伝播
+        batch_size = x.size(0)
+        total_kl = 0.0
+
+        for layer in self.layers[:-1]:
+            total_kl = total_kl + layer.get_kl_loss(batch_size)
+            x = layer(x)
+
+        # 最終層: NLL + 最終層自身のKL
+        return self.layers[-1].get_loss(x, y) + total_kl
+
     def train_mode(self):
-        """全レイヤーを学習モードに設定"""
-        self.train()
-        self.likelihood.train()
+        super().train_mode()
         for layer in self.layers:
             layer.train_mode()
-    
+
     def eval_mode(self):
-        """全レイヤーを評価モードに設定"""
-        self.eval()
-        self.likelihood.eval()
+        super().eval_mode()
         for layer in self.layers:
             layer.eval_mode()
-    
+
     def print_model_info(self):
-        """モデル構造の詳細を表示"""
         total_gps = sum(
             layer.input_size * layer.output_size for layer in self.layers
         )
-        total_inducing = total_gps * self.num_inducing
-        
-        print("=" * 60)
-        print("GP-KAN Model Architecture")
-        print("=" * 60)
-        print(f"Layer structure: {self.layer_sizes}")
-        print(f"Number of layers: {self.num_layers}")
+        self._print_common_info("GP-KAN")
         print(f"Total GP edges: {total_gps}")
-        print(f"Inducing points per GP: {self.num_inducing}")
-        print(f"Total inducing points: {total_inducing}")
-        print(f"Likelihood: {self.likelihood}")
-        print("-" * 60)
-        
+        print(f"Total inducing points: {total_gps * self.num_inducing}")
         for i, layer in enumerate(self.layers):
             num_edges = layer.input_size * layer.output_size
-            print(f"Layer {i+1}: {layer.input_size}→{layer.output_size} " +
-                  f"({num_edges} GP edges)")
+            print(
+                f"Layer {i+1}: "
+                f"{layer.input_size}→{layer.output_size} ({num_edges} edges)"
+            )
         print("=" * 60)
