@@ -26,54 +26,78 @@ pip install -r requirements.txt
 
 ---
 
-## 最初に読むノートブック
-
-### 1. 単一ニューロンの動作確認
-[simulations/gp_neuron_expr.ipynb](simulations/gp_neuron_expr.ipynb)
-
-GP ニューロンが入力分布を受け取り、出力分布を計算する過程を検証しています。理論の基礎を手を動かして確認するのに最適です。
-
-### 2. MNIST 分類デモ
-[simulations/MNIST/mnist.ipynb](simulations/MNIST/mnist.ipynb)
-
-GP-KAN を使った手書き数字分類のデモです。モデルが実際に動く様子を確認できます。
-
-### 3. 関数フィッティング実験
-[demo/4x_fitting_experiment/](demo/4x_fitting_experiment/)
-
-物理方程式（Feynman データセット）や最適化ベンチマーク（BBOB）への当てはめ実験です。コードが整理されており、実装の参照にも適しています。
-
----
-
-## 実験の流れ
-
-実験は番号順に段階を踏んで進んでいます。
-
-| ディレクトリ | 内容 |
-|---|---|
-| [demo/0x](demo/0x_kernel_rank_plot/), [1x](demo/1x_kernel_rank_analysis/) | GP の計算で使うカーネル行列の数値安定性を解析 |
-| [demo/2x](demo/2x_variational_learning/) | 変分推論の実装。ベースライン → Sparse GP → Deep GP → GPyTorch と段階的に比較 |
-| [demo/3x](demo/3x_COCO_fitting_evaluation/) | BBOB ベンチマークで SparseGP / DeepGP / GP-KAN の近似精度を比較 |
-| [demo/4x](demo/4x_fitting_experiment/) | コードをモジュール化し、物理方程式・ベンチマーク関数で性能を体系的に評価 |
-
----
-
 ## コード構成
 
 ```
 gpkan/
-├── lib/                    コアライブラリ
-│   ├── gp_dist.py          ガウス分布を表すデータ構造（平均・分散のペア）
-│   ├── layer.py            GP ニューロン層の実装
-│   ├── conv.py             GP ベースの畳み込み層
-│   ├── model.py            モデルの組み立て・保存・読み込み
-│   └── activations.py      ガウス分布のまま処理できる活性化関数群
-├── simulations/            基礎的な動作確認ノートブック
-└── demo/                   実験ノートブック群（番号順に発展）
-    └── 4x_fitting_experiment/  最新のモジュール化された実装
-        ├── gpkan_modules/      GP-KAN の実装本体
-        ├── benchmarks/         ベンチマーク関数の定義
-        └── configs/            実験設定の管理
+├── lib/                        コアライブラリ
+│   ├── gp_dist.py              ガウス分布を表すデータ構造（平均・分散のペア）
+│   ├── layer.py                GP ニューロン層の実装
+│   ├── conv.py                 GP ベースの畳み込み層
+│   ├── model.py                モデルの組み立て・保存・読み込み
+│   └── activations.py          ガウス分布のまま処理できる活性化関数群
+├── simulations/                基礎的な動作確認ノートブック
+└── experiments/                モジュール化された実験実装
+    └── gpkan_modules/          GP-KAN の実装本体
+```
+
+---
+
+## experiments の詳細
+
+### gpkan_modules — モデル実装
+
+3つのGaussian Processモデルを、共通の抽象基底クラスを用いて実装。
+
+```
+BaseGPModel (抽象基底クラス)
+├── GPKAN      (エッジベースGP)
+├── SparseGP   (変分GP)
+└── DeepGP     (多層GP)
+```
+
+| モデル | 適用場面 | 利点 | 計算量 |
+|--------|---------|------|--------|
+| **GPKAN** | 小規模・解釈性重視 | 活性化関数の可視化 | 中 |
+| **SparseGP** | 大規模データ | 高速・省メモリ | 低 |
+| **DeepGP** | 複雑な非線形問題 | 表現力が高い | 高 |
+
+すべてのモデルは以下の共通インターフェースを実装:
+
+| メソッド | 説明 | 戻り値 |
+|---------|------|--------|
+| `forward(x)` | 順伝播 | 予測値 |
+| `predict(x)` | 予測（不確実性付き） | (平均, 分散) |
+| `get_total_loss(x, y)` | 損失計算 | 損失値 |
+| `train_mode()` | 学習モード設定 | - |
+| `eval_mode()` | 評価モード設定 | - |
+| `print_model_info()` | モデル情報表示 | - |
+
+```python
+from gpkan_modules import GPKAN, SparseGP, DeepGP
+
+model = GPKAN(layer_sizes=[2, 1], num_inducing=16)
+model.train_mode()
+loss = model.get_total_loss(X, y)
+loss.backward()
+
+model.eval_mode()
+mean, var = model.predict(X_test)
+```
+
+ファイル構成:
+
+```
+gpkan_modules/
+├── base_model.py           抽象基底クラス
+├── gpkan_model.py          GPKANモデル
+├── sparse_gp_model.py      SparseGPモデル
+├── deep_gp_model.py        DeepGPモデル
+├── gpkan_layer.py          GPKANレイヤー
+├── gpkan_node.py           GPKANノード
+├── training_utils.py       学習ユーティリティ（create_dataset, train_gpkan, evaluate_model）
+├── visualization_utils.py  可視化ユーティリティ（学習曲線・予測結果・GP活性化関数）
+└── __init__.py
 ```
 
 ---
